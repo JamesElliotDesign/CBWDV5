@@ -23,7 +23,8 @@ const CLAIM_RADIUS = 500;
 const MEMBER_EXPIRY = 60 * 60 * 1000;
 const INTRUSION_RADIUS = 350;
 const INTRUSION_COOLDOWN = 1 * 60 * 1000;
-const CLAIM_TIMEOUT = 45 * 60 * 1000; // 45 minutes
+
+const TELEPORT_WARNINGS = {}; // { poiName: { steam64: timeoutID } }
 
 const lastIntrusionWarnings = {};
 const LEAVE_TRACKER = {};
@@ -32,6 +33,7 @@ const CLAIM_REGEX = /^!?\/?claim\s+([A-Za-z0-9_ -]+)\b/i;
 const CANCEL_CLAIM_REGEX = /^!?\/?cancel\s+([A-Za-z0-9_ -]+)\b/i;
 const CHECK_CLAIMS_REGEX = /^!?\/?check claims\b/i;
 const CHECK_POI_REGEX = /^!?\/?check\s+([A-Za-z0-9_ -]+)\b/i;
+const GRACE_REGEX = /^!?\/?poigrace\s+([A-Za-z0-9_ -]+)\b/i;
 
 const EXCLUDED_POIS = [];
 
@@ -130,15 +132,35 @@ function scheduleClaimReset() {
 }
 
 function resetClaims() {
+  // 🔁 Clear any pending teleport warnings
+  for (const poi in TELEPORT_WARNINGS) {
+    for (const steam64 in TELEPORT_WARNINGS[poi]) {
+      clearTimeout(TELEPORT_WARNINGS[poi][steam64]);
+    }
+  }
+  Object.keys(TELEPORT_WARNINGS).forEach(poi => {
+    delete TELEPORT_WARNINGS[poi];
+  });
+
+   // 🔁 Cancel any active grace timers
+  for (const poi in CLAIMS) {
+    if (CLAIMS[poi]?.grace?.timer) {
+      clearTimeout(CLAIMS[poi].grace.timer);
+    }
+  }
+
+  // ♻️ Reset claim state
   for (const poi in CLAIMS) {
     delete CLAIMS[poi];
   }
   for (const poi in CLAIM_HISTORY) {
     delete CLAIM_HISTORY[poi];
   }
-  console.log("♻️ Scheduled reset: All POI claims and claim histories cleared for server restart.");
+
+  console.log("♻️ Scheduled reset: All POI claims, claim histories, and teleport warnings cleared.");
   sendServerMessage("All POI claims have been reset for the new server cycle.");
 }
+
 
 scheduleClaimReset();
 
@@ -221,9 +243,13 @@ function handleLeaveEnter(poiName, playerName, distance, innerRadius) {
   }
 
   if (insideCount > 0 && claim.cooldown) {
-    console.log(`🔄 ${poiName}: owner/member re-entered, cancelling expiry timer`);
-    clearTimeout(claim.cooldown);
-    claim.cooldown = null;
+    if (claim.grace?.active) {
+      console.log(`🔄 ${poiName}: grace active — cancelling cooldown.`);
+      clearTimeout(claim.cooldown);
+      claim.cooldown = null;
+    } else {
+      console.log(`🔄 ${poiName}: re-entry ignored — cooldown continues (no grace).`);
+    }
   }
 }
 
@@ -250,13 +276,51 @@ async function checkPOIZones() {
         }
 
         if (dist <= config.kickRadius) {
-          if (!claim || !isPlayerOwnerOrMember(normalized, claim)) {
-            if (player.steam64) {
-              await teleportPlayerBySteam64(player.steam64, config.safePos);
-              console.log(`🟢 ${playerName} kicked from ${poiName}`);
-            } else {
-              console.warn(`❌ Could not teleport ${playerName} — Steam64 missing`);
+          const isOwnerOrMember = claim && isPlayerOwnerOrMember(normalized, claim);
+          const inGrace = claim?.grace?.active === true;
+
+          const shouldTeleport =
+            !claim || (claim.cooldown && !inGrace);
+
+          if (shouldTeleport) {
+            if (!TELEPORT_WARNINGS[poiName]) TELEPORT_WARNINGS[poiName] = {};
+
+            const existingTimeout = TELEPORT_WARNINGS[poiName][player.steam64];
+            if (!existingTimeout) {
+              // Warn player and start countdown
+              await sendServerMessage(`${playerName}, you must leave or claim ${poiName} within 30 seconds or you will be teleported.`);
+              
+              const timeoutID = setTimeout(async () => {
+                // Re-check if POI is still unclaimed and player is still inside
+                const updatedSession = sessionCache.find(p => p.steam64 === player.steam64);
+                const updatedClaim = CLAIMS[poiName];
+                const updatedInGrace = updatedClaim?.grace?.active === true;
+                const stillNeedsTeleport = !updatedClaim || (updatedClaim.cooldown && !updatedInGrace);
+
+                if (updatedSession && stillNeedsTeleport) {
+
+                  const dx = updatedSession.position[0] - config.position[0];
+                  const dz = updatedSession.position[1] - config.position[2];
+                  const newDist = Math.sqrt(dx * dx + dz * dz);
+
+                  if (newDist <= config.kickRadius) {
+                    await teleportPlayerBySteam64(player.steam64, config.safePos);
+                    console.log(`🟢 ${playerName} teleported from ${poiName} after 15s warning.`);
+                  }
+                }
+
+                delete TELEPORT_WARNINGS[poiName][player.steam64];
+              }, 30000);
+
+              TELEPORT_WARNINGS[poiName][player.steam64] = timeoutID;
             }
+          }
+        } else {
+          // Player left the kick zone — cancel warning if it exists
+          if (TELEPORT_WARNINGS[poiName]?.[player.steam64]) {
+            clearTimeout(TELEPORT_WARNINGS[poiName][player.steam64]);
+            delete TELEPORT_WARNINGS[poiName][player.steam64];
+            console.log(`🚫 ${playerName} left ${poiName} before teleport — warning canceled.`);
           }
         }
 
@@ -282,19 +346,6 @@ function cleanExpiredGroupMembers() {
 }
 
 setInterval(cleanExpiredGroupMembers, 60 * 1000);
-
-function releaseExpiredPOIs() {
-  const now = Date.now();
-  for (const poi in CLAIMS) {
-    if (now - CLAIMS[poi].timestamp >= CLAIM_TIMEOUT) {
-      delete CLAIMS[poi];
-      console.log(`⌛ ${poi} auto-unclaimed after 45 min timeout`);
-      sendServerMessage(`${poi} is now available to claim again!`);
-    }
-  }
-}
-
-setInterval(releaseExpiredPOIs, 60 * 1000); // Check expired claims every 1 min
 
 const processedMessages = new Map();
 setInterval(() => {
@@ -366,13 +417,132 @@ app.post("/webhook", async (req, res) => {
           );
           return res.sendStatus(204);
         }
-        await sendServerMessage(
-          CLAIMS[corrected]
-            ? `${corrected} is claimed by ${CLAIMS[corrected].displayName}.`
-            : `${corrected} is available!`
-        );
+
+        const claim = CLAIMS[corrected];
+        if (claim) {
+          const tier = corrected.includes("T5") ? "T5" : "T1-4";
+          const lifetime = tier === "T5" ? 60 * 60 * 1000 : 45 * 60 * 1000;
+          const timeLeftMs = claim.timestamp + lifetime - Date.now();
+          const minsLeft = Math.max(1, Math.floor(timeLeftMs / 60000));
+
+          await sendServerMessage(
+            `${corrected} is claimed by ${claim.displayName} (${minsLeft} min left).`
+          );
+        } else {
+          await sendServerMessage(`${corrected} is available!`);
+        }
+
         return res.sendStatus(204);
       }
+
+      // ✅ Handle POI Grace
+      const graceMatch = messageContent.match(GRACE_REGEX);
+      if (graceMatch) {
+        const corrected = findMatchingPOI(graceMatch[1]);
+        if (!corrected || !CLAIMS[corrected]) {
+          await sendServerMessage(
+            corrected
+              ? `${corrected} is not claimed.`
+              : `Invalid POI: ${graceMatch[1]}.`
+          );
+          return res.sendStatus(204);
+        }
+
+        const normalized = playerName.trim().toLowerCase();
+        const claim = CLAIMS[corrected];
+        const isOwner = claim.player === normalized;
+        const isMember = claim.members?.some(m => m.name === normalized);
+
+        if (!(isOwner || isMember)) {
+          await sendServerMessage(`${playerName}, you are not authorized to request grace for ${corrected}.`);
+          return res.sendStatus(204);
+        }
+
+        if (!claim.cooldown) {
+          await sendServerMessage(`${corrected} is not on cooldown. No grace needed.`);
+          return res.sendStatus(204);
+        }
+
+        // Pause cooldown and activate grace
+        clearTimeout(claim.cooldown);
+        claim.cooldown = null;
+
+        if (claim.grace?.timer) {
+          clearTimeout(claim.grace.timer);
+        }
+
+        claim.grace = {
+          active: true,
+          grantedAt: Date.now(),
+          timer: setTimeout(() => {
+            claim.grace.active = false;
+            claim.grace.timer = null;
+
+            if (!LEAVE_TRACKER[corrected] || LEAVE_TRACKER[corrected].size === 0) {
+              claim.cooldown = setTimeout(() => {
+                delete CLAIMS[corrected];
+                console.log(`⌛ ${corrected} auto-unclaimed after grace-expiry timer`);
+                sendServerMessage(`${corrected} is now available again.`);
+              }, 45 * 60 * 1000);
+
+              console.log(`⏳ ${corrected}: grace expired, starting cooldown again.`);
+              sendServerMessage(`${corrected} grace period has ended.`);
+            }
+
+          }, 5 * 60 * 1000)
+        };
+
+        await sendServerMessage(`${playerName} has activated a 5-minute grace period for ${corrected}.`);
+        return res.sendStatus(204);
+      }
+
+      // ✅ Handle /joingroup
+      const joinGroupMatch = messageContent.match(/^!?\/?joingroup\s+([A-Za-z0-9_ -]+)\b/i);
+      if (joinGroupMatch) {
+        const corrected = findMatchingPOI(joinGroupMatch[1]);
+        if (!corrected || !CLAIMS[corrected]) {
+          await sendServerMessage(
+            corrected
+              ? `${corrected} is not currently claimed.`
+              : `Unknown POI: ${joinGroupMatch[1]}.`
+          );
+          return res.sendStatus(204);
+        }
+
+        const claim = CLAIMS[corrected];
+        const normalized = playerName.trim().toLowerCase();
+
+        if (isPlayerOwnerOrMember(normalized, claim)) {
+          await sendServerMessage(`${playerName}, you are already a member of the group at ${corrected}.`);
+          return res.sendStatus(204);
+        }
+
+        if (CLAIM_HISTORY[corrected]?.has(normalized)) {
+          await sendServerMessage(`${playerName}, you have already claimed ${corrected} this restart and cannot join again.`);
+          return res.sendStatus(204);
+        }
+
+        const dx = player.position[0] - POI_CONFIG[corrected].position[0];
+        const dz = player.position[1] - POI_CONFIG[corrected].position[2];
+        const dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist > CLAIM_RADIUS) {
+          await sendServerMessage(`${playerName}, you must be within ${CLAIM_RADIUS}m of ${corrected} to join the group.`);
+          return res.sendStatus(204);
+        }
+
+        claim.members.push({
+          name: normalized,
+          displayName: playerName.trim(),
+          timestamp: Date.now()
+        });
+        CLAIM_HISTORY[corrected].add(normalized);
+
+        await sendServerMessage(`${playerName} has joined the claim group at ${corrected}.`);
+        console.log(`👥 ${playerName} joined ${corrected} via /joingroup (${dist.toFixed(2)}m)`);
+        return res.sendStatus(204);
+      }
+
 
       // ✅ Handle claim
     const claimMatch = messageContent.match(CLAIM_REGEX);
@@ -418,40 +588,51 @@ app.post("/webhook", async (req, res) => {
       }
 
       // ✅ Actually claim
+      const claimTier = corrected.includes("T5") ? "T5" : "T1-4";
+      const lifetime = claimTier === "T5" ? 60 * 60 * 1000 : 45 * 60 * 1000;
+
+      const claimTimeoutID = setTimeout(() => {
+      CLAIMS[corrected].cooldown = true;
+      CLAIMS[corrected].claimLifetimeTimer = null;
+
+      sendServerMessage(`${corrected} claim has expired — it is now on cooldown.`);
+      console.log(`⌛ ${corrected} auto-expired into cooldown after lifetime limit.`);
+
+      // 🚪 Teleport out any non-grace players still inside
+      for (const player of sessionCache) {
+        const dx = player.position[0] - POI_CONFIG[corrected].position[0];
+        const dz = player.position[1] - POI_CONFIG[corrected].position[2];
+        const dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist <= POI_CONFIG[corrected].kickRadius) {
+          const pname = player.name.trim().toLowerCase();
+          const inGrace = CLAIMS[corrected]?.grace?.active;
+          if (!inGrace) {
+            teleportPlayerBySteam64(player.steam64, POI_CONFIG[corrected].safePos);
+            console.log(`🚪 ${player.name} force-teleported from ${corrected} after claim timeout.`);
+          }
+        }
+      }
+
+      // 🔁 Automatically unclaim after 45-minute cooldown
+      CLAIMS[corrected].cooldownTimer = setTimeout(() => {
+        delete CLAIMS[corrected];
+        console.log(`⌛ ${corrected} auto-unclaimed after 45-min cooldown post lifetime.`);
+        sendServerMessage(`${corrected} is now available again.`);
+      }, 45 * 60 * 1000);
+
+    }, lifetime);
+
       CLAIMS[corrected] = {
         player: normalizedClaimant,
         displayName: playerName.trim(),
         timestamp: Date.now(),
-        members: [{ name: normalizedClaimant, timestamp: Date.now() }]
+        members: [{ name: normalizedClaimant, timestamp: Date.now(), displayName: playerName.trim() }],
+        claimLifetimeTimer: claimTimeoutID,
       };
 
       // ✅ Add main claimant to claim history
       CLAIM_HISTORY[corrected].add(normalizedClaimant);
-
-      // ✅ Also add nearby group members
-      for (const p of sessionCache) {
-        const normalized = p.name.trim().toLowerCase();
-        const dx = p.position[0] - POI_CONFIG[corrected].position[0];
-        const dz = p.position[1] - POI_CONFIG[corrected].position[2];
-        const dist = Math.sqrt(dx * dx + dz * dz);
-
-        if (dist <= CLAIM_RADIUS) {
-          const alreadyAdded = CLAIMS[corrected].members.some(
-            m => m.name === normalized
-          );
-          if (!alreadyAdded) {
-            CLAIMS[corrected].members.push({
-              name: normalized,
-              displayName: p.name.trim(),
-              timestamp: Date.now()
-            });
-            CLAIM_HISTORY[corrected].add(normalized); // ✅ Mark them in the history too
-            console.log(
-              `👥 ${p.name} added to ${corrected} group (${dist.toFixed(2)}m)`
-            );
-          }
-        }
-      }
 
       const displayNames = CLAIMS[corrected].members
         .filter(m => m.name !== normalizedClaimant)
