@@ -318,18 +318,32 @@ async function checkPOIZones() {
         for (const playerName in TELEPORT_WARNINGS) {
             const player = sessionCache.find(p => p.name === playerName);
             const warning = TELEPORT_WARNINGS[playerName];
-            const config = POI_CONFIG[warning.poiName];
+            const warningConfig = POI_CONFIG[warning.poiName];
 
             let isSafe = true;
-            if (player && config) {
-                const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                if (distSquared <= (config.kickRadius * config.kickRadius)) {
-                    isSafe = false; // Player is still inside the kick zone
+            if (player && warningConfig) {
+                // First, check if the player is still inside the zone they were warned about.
+                const distSquaredFromWarning = Math.pow(player.position[0] - warningConfig.position[0], 2) + Math.pow(player.position[1] - warningConfig.position[2], 2);
+                if (distSquaredFromWarning <= (warningConfig.kickRadius * warningConfig.kickRadius)) {
+                    isSafe = false;
+                }
+
+                // Now, check if the player is currently in ANY claimed POI where they are an authorized member.
+                // If they are, they are considered safe, and any old warning should be cancelled.
+                for (const [poiName, config] of Object.entries(POI_CONFIG)) {
+                    const claim = CLAIMS[poiName];
+                    if (claim && claim.state === 'ACTIVE' && claim.members.has(player.name.trim().toLowerCase())) {
+                        const distSquaredFromClaim = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
+                        if (distSquaredFromClaim <= (config.kickRadius * config.kickRadius)) {
+                            isSafe = true; // Player is in a POI they have claimed. They are safe.
+                            break; // Exit the inner loop
+                        }
+                    }
                 }
             }
 
             if (isSafe) {
-                console.log(`🚶 ${playerName} left ${warning.poiName}. Teleport cancelled.`);
+                console.log(`🚶 ${playerName} is now in a safe location. Teleport cancelled.`);
                 clearTimeout(warning.timerId);
                 delete TELEPORT_WARNINGS[playerName];
             }
@@ -339,65 +353,61 @@ async function checkPOIZones() {
             const claim = CLAIMS[poiName];
 
             // --- ACTIVE PHASE LOGIC (checks if group left early) ---
-              // --- ACTIVE PHASE LOGIC (checks if group left early) ---
-          if (claim && claim.state === 'ACTIVE') {
-              // First, update the last known position for each online member.
-              for (const memberName of claim.members) {
-                  const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-                  if (player) {
-                      claim.membersLastPos[memberName] = player.position;
-                  }
-              }
+            if (claim && claim.state === 'ACTIVE') {
+                // First, update the last known position for each online member.
+                for (const memberName of claim.members) {
+                    const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
+                    if (player && player.position) { // Only update if position data is valid
+                        claim.membersLastPos[memberName] = player.position;
+                    }
+                }
 
-              let playersInsideKickRadius = 0;
-              for (const memberName of claim.members) {
-                  const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-                  if (player) {
-                      const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                      if (distSquared <= (config.kickRadius * config.kickRadius)) {
-                          playersInsideKickRadius++;
-                      }
-                  }
-              }
+                let playersInsideKickRadius = 0;
+                let playersInside500mZone = 0;
+                let onlineMembersCount = 0; // New counter for members with valid data
 
-              // If anyone enters the kick radius, the claim is permanently marked as "engaged".
-              if (playersInsideKickRadius > 0) {
-                  claim.hasBeenEngaged = true;
-              }
+                for (const memberName of claim.members) {
+                    const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
+                    if (player && player.position) { // Only consider players who are online with valid position data
+                        onlineMembersCount++;
+                        const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
+                        if (distSquared <= (config.kickRadius * config.kickRadius)) {
+                            playersInsideKickRadius++;
+                        }
+                        if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
+                            playersInside500mZone++;
+                        }
+                    }
+                }
 
-              // --- NEW DELAYED CHECK LOGIC ---
-              if (claim.hasBeenEngaged) {
-                  if (playersInsideKickRadius === 0 && !claim.cooldownCheckTimer) {
-                      // POI is empty, START the 60-second check timer.
-                      console.log(`🟡 ${poiName} is empty. Starting 60s cooldown check timer.`);
-                      claim.cooldownCheckTimer = setTimeout(() => {
-                          console.log(`⏰ 60s timer for ${poiName} is up. Checking for respawn...`);
-                          startCooldown(poiName, { checkWipe: true });
-                      }, 60 * 1000); // 60 second delay
-                  } else if (playersInsideKickRadius > 0 && claim.cooldownCheckTimer) {
-                      // Players re-entered during the 60s delay, CANCEL the check.
-                      console.log(`🟢 Players re-entered ${poiName}. Cancelling cooldown check.`);
-                      clearTimeout(claim.cooldownCheckTimer);
-                      claim.cooldownCheckTimer = null;
-                  }
-              } else {
-                  // This is for the original abandonment logic (never engaged)
-                  let playersInside500mZone = 0;
-                  for (const memberName of claim.members) {
-                      const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-                      if (player) {
-                          const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                          if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
-                              playersInside500mZone++;
-                          }
-                      }
-                  }
-                  if (playersInside500mZone === 0) {
-                      console.log(`🟡 ${poiName} was claimed but never engaged. Abandoning claim.`);
-                      startCooldown(poiName, { checkWipe: false });
-                  }
-              }
-          }
+                // If anyone enters the kick radius, the claim is permanently marked as "engaged".
+                if (playersInsideKickRadius > 0) {
+                    claim.hasBeenEngaged = true;
+                }
+
+                // Check for abandonment only if we have positive confirmation of players' locations.
+                if (onlineMembersCount > 0) {
+                    if (claim.hasBeenEngaged && playersInsideKickRadius === 0 && !claim.cooldownCheckTimer) {
+                        // POI was engaged, and we can confirm all online members are outside the kick radius.
+                        console.log(`🟡 ${poiName} is empty. Starting 60s cooldown check timer.`);
+                        claim.cooldownCheckTimer = setTimeout(() => {
+                            console.log(`⏰ 60s timer for ${poiName} is up. Checking for respawn...`);
+                            startCooldown(poiName, { checkWipe: true });
+                        }, 60 * 1000);
+                    } else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
+                        // POI was never engaged, and we can confirm all online members are outside the 500m zone.
+                        console.log(`🟡 ${poiName} was claimed but never engaged. Abandoning claim.`);
+                        startCooldown(poiName, { checkWipe: false });
+                    }
+                }
+                
+                // This part handles players re-entering during the 60s delay. It remains the same.
+                if (claim.hasBeenEngaged && playersInsideKickRadius > 0 && claim.cooldownCheckTimer) {
+                    console.log(`🟢 Players re-entered ${poiName}. Cancelling cooldown check.`);
+                    clearTimeout(claim.cooldownCheckTimer);
+                    claim.cooldownCheckTimer = null;
+                }
+            }
 
             // --- UNIVERSAL ENFORCEMENT & WARNING LOOP ---
             for (const player of sessionCache) {
