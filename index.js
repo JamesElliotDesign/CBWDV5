@@ -334,7 +334,7 @@ async function checkPOIZones() {
             let isSafe = true;
             if (player && config) {
                 const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                if (distSquared <= (config.kickRadius * config.kickRadius)) {
+                if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
                     isSafe = false; // Player is still inside the kick zone
                 }
             }
