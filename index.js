@@ -44,6 +44,7 @@ const TELEPORT_WARNING_DURATION = 30 * 1000; // 30 seconds
 // Radii and Distances (using squared values is faster than Math.sqrt)
 const GROUPING_RADIUS_SQUARED = 100 * 100; // 100m
 const WIPE_CHECK_RADIUS_SQUARED = 500 * 500; // 500m
+const RESPAWN_DISTANCE_THRESHOLD_SQUARED = 400 * 400; // 400m
 
 // List of T5 POIs that get an extended claim time
 const T5_POIS = new Set([
@@ -231,7 +232,7 @@ async function forceExpireAndStartCooldown(poiName) {
             const normalizedName = player.name.trim().toLowerCase();
             if (currentClaim.members.has(normalizedName)) {
                 const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
+                if (distSquared <= (config.kickRadius * config.kickRadius)) {
                     console.log(`Evicting ${player.name} from ${poiName}.`);
                     if (player.steam64) {
                         teleportPromises.push(
@@ -248,12 +249,7 @@ async function forceExpireAndStartCooldown(poiName) {
     }, 60 * 1000); // 60 second delay
 }
 
-
-// --- ADD THIS NEW HELPER FUNCTION ---
-// This function handles the transition to the COOLDOWN state
-function startCooldown(poiName, options = {
-    checkWipe: false
-}) {
+function startCooldown(poiName, options = { checkWipe: false }) {
     const claim = CLAIMS[poiName];
     if (!claim || claim.state !== 'ACTIVE') return;
 
@@ -261,35 +257,36 @@ function startCooldown(poiName, options = {
 
     let gracePeriodGranted = false;
     if (options.checkWipe) {
-        console.log(`🩺 Checking for team wipe at ${poiName}...`);
-        const config = POI_CONFIG[poiName];
+        console.log(`🩺 Checking for respawn vs. voluntary exit at ${poiName}...`);
         let membersFound = 0;
-        let membersOutsideWipeRadius = 0;
+        let membersWhoRespawned = 0;
 
         for (const memberName of claim.members) {
             const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-            if (player) {
+            const lastPos = claim.membersLastPos[memberName];
+
+            if (player && lastPos) {
                 membersFound++;
-                const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                if (distSquared > WIPE_CHECK_RADIUS_SQUARED) {
-                    membersOutsideWipeRadius++;
+                const distMovedSquared = Math.pow(player.position[0] - lastPos[0], 2) + Math.pow(player.position[1] - lastPos[1], 2);
+                
+                if (distMovedSquared > RESPAWN_DISTANCE_THRESHOLD_SQUARED) {
+                    membersWhoRespawned++;
                 }
             }
         }
-
-        // If we found members online, and ALL of them are outside the 500m radius
-        if (membersFound > 0 && membersFound === membersOutsideWipeRadius) {
+        
+        if (membersFound > 0 && membersFound === membersWhoRespawned) {
             gracePeriodGranted = true;
             claim.gracePeriodAllowed = true;
-            console.log(`✅ Team wipe detected for ${poiName}. Allowing grace period.`);
+            console.log(`✅ Respawn detected for ${poiName}. Granting grace period.`);
             sendServerMessage(`A team wipe was detected at ${poiName}. Your group may return for gear. A 15-min timer will start when the first member arrives.`);
         } else {
-            console.log(`❌ No team wipe at ${poiName}. At least one member is within 500m.`);
+            console.log(`❌ Voluntary exit detected for ${poiName}. No grace period granted.`);
+            sendServerMessage(`${claim.displayName}'s group has left ${poiName}. It is now on cooldown.`);
         }
-    }
-
-    if (!gracePeriodGranted) {
-        sendServerMessage(`${poiName} is now on a 45-minute cooldown.`);
+    } else {
+        // This is for a simple abandonment without engaging the POI.
+        sendServerMessage(`${poiName} claim was abandoned and is now on cooldown.`);
     }
 
     claim.state = 'COOLDOWN';
@@ -299,13 +296,6 @@ function startCooldown(poiName, options = {
         console.log(`✅ ${poiName}: Cooldown finished.`);
         sendServerMessage(`${poiName} is now available to claim again!`);
     }, COOLDOWN_DURATION);
-}
-
-
-function isPlayerOwnerOrMember(playerName, claim) {
-    if (!claim) return false;
-    if (claim.player === playerName) return true;
-    return claim.members?.some(m => m.name === playerName);
 }
 
 function handleWarning(playerName, poiName, now) {
@@ -318,7 +308,6 @@ function handleWarning(playerName, poiName, now) {
         sendServerMessage(`Warning: ${playerName}, you are near ${poiName}, you need to claim it to run it.`);
     }
 }
-
 
 // --- REPLACE THE ENTIRE FUNCTION ---
 async function checkPOIZones() {
@@ -334,7 +323,7 @@ async function checkPOIZones() {
             let isSafe = true;
             if (player && config) {
                 const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
+                if (distSquared <= (config.kickRadius * config.kickRadius)) {
                     isSafe = false; // Player is still inside the kick zone
                 }
             }
@@ -350,24 +339,50 @@ async function checkPOIZones() {
             const claim = CLAIMS[poiName];
 
             // --- ACTIVE PHASE LOGIC (checks if group left early) ---
-            if (claim && claim.state === 'ACTIVE') {
-                let playersInsideCount = 0;
-                for (const memberName of claim.members) {
-                    const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-                    if (player) {
-                        const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                        if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
-                            playersInsideCount++;
-                        }
-                    }
-                }
-                if (playersInsideCount === 0) {
-                    console.log(`🟢 ${poiName}: All members have left. Checking for wipe.`);
-                    startCooldown(poiName, {
-                        checkWipe: true
-                    });
-                }
-            }
+              if (claim && claim.state === 'ACTIVE') {
+                  // First, update the last known position for each online member.
+                  for (const memberName of claim.members) {
+                      const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
+                      if (player) {
+                          claim.membersLastPos[memberName] = player.position;
+                      }
+                  }
+
+                  let playersInsideKickRadius = 0;
+                  let playersInside500mZone = 0;
+
+                  for (const memberName of claim.members) {
+                      const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
+                      if (player) {
+                          const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
+                          if (distSquared <= (config.kickRadius * config.kickRadius)) {
+                              playersInsideKickRadius++;
+                          }
+                          if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
+                              playersInside500mZone++;
+                          }
+                      }
+                  }
+
+                  // If anyone enters the kick radius, the claim is permanently marked as "engaged".
+                  if (playersInsideKickRadius > 0) {
+                      claim.hasBeenEngaged = true;
+                  }
+
+                  // Check for abandonment based on the "engaged" state.
+                  if (claim.hasBeenEngaged && playersInsideKickRadius === 0) {
+                      // The POI was engaged, and now everyone has left the kick radius.
+                      // This is the trigger for the advanced respawn check.
+                      console.log(`🟢 ${poiName} was engaged and is now empty. Checking for respawn...`);
+                      startCooldown(poiName, { checkWipe: true });
+
+                  } else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
+                      // The POI was claimed but never engaged, and everyone has left the 500m staging area.
+                      // This is a simple abandonment.
+                      console.log(`🟡 ${poiName} was claimed but never engaged. Abandoning claim.`);
+                      startCooldown(poiName, { checkWipe: false }); // Standard cooldown, no grace period.
+                  }
+              }
 
             // --- UNIVERSAL ENFORCEMENT & WARNING LOOP ---
             for (const player of sessionCache) {
@@ -566,8 +581,10 @@ app.post("/webhook", async (req, res) => {
                     activeUntil: Date.now() + claimDuration,
                     cooldownUntil: null,
                     gracePeriodAllowed: false,
+                    hasBeenEngaged: false,
                     individualGracePeriods: {},
                     members: new Set([normalizedClaimant]),
+                    membersLastPos: {},
                     displayMembers: [{
                         name: normalizedClaimant,
                         displayName: playerName.trim()
