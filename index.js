@@ -339,50 +339,65 @@ async function checkPOIZones() {
             const claim = CLAIMS[poiName];
 
             // --- ACTIVE PHASE LOGIC (checks if group left early) ---
-              if (claim && claim.state === 'ACTIVE') {
-                  // First, update the last known position for each online member.
-                  for (const memberName of claim.members) {
-                      const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-                      if (player) {
-                          claim.membersLastPos[memberName] = player.position;
+              // --- ACTIVE PHASE LOGIC (checks if group left early) ---
+          if (claim && claim.state === 'ACTIVE') {
+              // First, update the last known position for each online member.
+              for (const memberName of claim.members) {
+                  const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
+                  if (player) {
+                      claim.membersLastPos[memberName] = player.position;
+                  }
+              }
+
+              let playersInsideKickRadius = 0;
+              for (const memberName of claim.members) {
+                  const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
+                  if (player) {
+                      const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
+                      if (distSquared <= (config.kickRadius * config.kickRadius)) {
+                          playersInsideKickRadius++;
                       }
                   }
+              }
 
-                  let playersInsideKickRadius = 0;
+              // If anyone enters the kick radius, the claim is permanently marked as "engaged".
+              if (playersInsideKickRadius > 0) {
+                  claim.hasBeenEngaged = true;
+              }
+
+              // --- NEW DELAYED CHECK LOGIC ---
+              if (claim.hasBeenEngaged) {
+                  if (playersInsideKickRadius === 0 && !claim.cooldownCheckTimer) {
+                      // POI is empty, START the 60-second check timer.
+                      console.log(`🟡 ${poiName} is empty. Starting 60s cooldown check timer.`);
+                      claim.cooldownCheckTimer = setTimeout(() => {
+                          console.log(`⏰ 60s timer for ${poiName} is up. Checking for respawn...`);
+                          startCooldown(poiName, { checkWipe: true });
+                      }, 60 * 1000); // 60 second delay
+                  } else if (playersInsideKickRadius > 0 && claim.cooldownCheckTimer) {
+                      // Players re-entered during the 60s delay, CANCEL the check.
+                      console.log(`🟢 Players re-entered ${poiName}. Cancelling cooldown check.`);
+                      clearTimeout(claim.cooldownCheckTimer);
+                      claim.cooldownCheckTimer = null;
+                  }
+              } else {
+                  // This is for the original abandonment logic (never engaged)
                   let playersInside500mZone = 0;
-
                   for (const memberName of claim.members) {
                       const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
                       if (player) {
                           const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                          if (distSquared <= (config.kickRadius * config.kickRadius)) {
-                              playersInsideKickRadius++;
-                          }
                           if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
                               playersInside500mZone++;
                           }
                       }
                   }
-
-                  // If anyone enters the kick radius, the claim is permanently marked as "engaged".
-                  if (playersInsideKickRadius > 0) {
-                      claim.hasBeenEngaged = true;
-                  }
-
-                  // Check for abandonment based on the "engaged" state.
-                  if (claim.hasBeenEngaged && playersInsideKickRadius === 0) {
-                      // The POI was engaged, and now everyone has left the kick radius.
-                      // This is the trigger for the advanced respawn check.
-                      console.log(`🟢 ${poiName} was engaged and is now empty. Checking for respawn...`);
-                      startCooldown(poiName, { checkWipe: true });
-
-                  } else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
-                      // The POI was claimed but never engaged, and everyone has left the 500m staging area.
-                      // This is a simple abandonment.
+                  if (playersInside500mZone === 0) {
                       console.log(`🟡 ${poiName} was claimed but never engaged. Abandoning claim.`);
-                      startCooldown(poiName, { checkWipe: false }); // Standard cooldown, no grace period.
+                      startCooldown(poiName, { checkWipe: false });
                   }
               }
+          }
 
             // --- UNIVERSAL ENFORCEMENT & WARNING LOOP ---
             for (const player of sessionCache) {
@@ -585,6 +600,7 @@ app.post("/webhook", async (req, res) => {
                     individualGracePeriods: {},
                     members: new Set([normalizedClaimant]),
                     membersLastPos: {},
+                    cooldownCheckTimer: null,
                     displayMembers: [{
                         name: normalizedClaimant,
                         displayName: playerName.trim()
