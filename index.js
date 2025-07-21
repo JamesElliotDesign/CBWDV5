@@ -433,29 +433,45 @@ async function checkPOIZones() {
                     }
                 }
 
-                // If player is inside kick radius and NOT authorized
-                if (distSquared <= (config.kickRadius * config.kickRadius) && !isAuthorized) {
-                    if (!TELEPORT_WARNINGS[playerName]) {
-                        // Issue a new warning
-                        console.log(`⚠️ ${playerName} entered restricted area ${poiName}. Starting 30s timer.`);
-                        sendServerMessage(`Warning: ${playerName}, you are in a restricted area. You will be removed in 30 seconds if you do not leave.`);
-                        const timerId = setTimeout(() => {
-                            teleportPlayerBySteam64(player.steam64, config.safePos)
-                                .then(() => console.log(`🚀 ${playerName} teleported from ${poiName}.`))
-                                .catch(err => console.error(`Teleport failed for ${playerName}`, err));
-                            delete TELEPORT_WARNINGS[playerName];
-                        }, TELEPORT_WARNING_DURATION);
-                        TELEPORT_WARNINGS[playerName] = {
-                            timerId,
-                            poiName
-                        };
-                    }
-                }
+              // ✅ PASTE THIS CORRECTED CODE IN ITS PLACE
 
-                // Outer radius warning for active claims
-                if (claim && claim.state === 'ACTIVE' && !isAuthorized && distSquared <= (INTRUSION_RADIUS * INTRUSION_RADIUS)) {
-                    handleWarning(playerName, poiName, now);
-                }
+// If player is inside kick radius and NOT authorized
+              if (distSquared <= (config.kickRadius * config.kickRadius) && !isAuthorized) {
+                  if (!TELEPORT_WARNINGS[playerName]) {
+                      // Issue a new warning
+                      console.log(`⚠️ ${playerName} entered restricted area ${poiName}. Starting 30s timer.`);
+                      sendServerMessage(`Warning: ${playerName}, you are in a restricted area. You will be removed in 30 seconds if you do not leave.`);
+                      const timerId = setTimeout(async () => {
+                      try {
+                          const currentPlayerState = sessionCache.find(p => p.steam64 === player.steam64);
+                          const config = POI_CONFIG[poiName];
+
+                          if (currentPlayerState && config) {
+                              const distSquared = Math.pow(currentPlayerState.position[0] - config.position[0], 2) + Math.pow(currentPlayerState.position[1] - config.position[2], 2);
+                              
+                              if (distSquared <= (config.kickRadius * config.kickRadius)) {
+                                  console.log(`🚀 Final check passed. Teleporting ${currentPlayerState.name} from ${poiName}.`);
+                                  await teleportPlayerBySteam64(currentPlayerState.steam64, config.safePos);
+                              } else {
+                                  console.log(`🚶 Final check failed. ${currentPlayerState.name} left the area. Teleport aborted.`);
+                              }
+                          }
+                      } catch (e) {
+                          console.error("Error during final teleport check:", e);
+                      } finally {
+                          delete TELEPORT_WARNINGS[player.name.trim()];
+                      }
+                      }, TELEPORT_WARNING_DURATION);
+                      TELEPORT_WARNINGS[playerName] = {
+                          timerId,
+                          poiName
+                      };
+                  }
+              }
+              // This is now an "else if", preventing the double warning
+              else if (claim && claim.state === 'ACTIVE' && !isAuthorized && distSquared <= (INTRUSION_RADIUS * INTRUSION_RADIUS)) {
+                  handleWarning(playerName, poiName, now);
+              }
             }
         }
     } catch (err) {
