@@ -357,13 +357,7 @@ async function checkPOIZones() {
 
             // --- ACTIVE PHASE LOGIC (checks if group left early) ---
             if (claim && claim.state === 'ACTIVE') {
-                // First, update the last known position for each online member.
-                for (const memberName of claim.members) {
-                    const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-                    if (player && player.position) { // Only update if position data is valid
-                        claim.membersLastPos[memberName] = player.position;
-                    }
-                }
+                // First, update the last known position for each online member
 
                 let playersInsideKickRadius = 0;
                 let playersInside500mZone = 0;
@@ -376,6 +370,7 @@ async function checkPOIZones() {
                         const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
                         if (distSquared <= (config.kickRadius * config.kickRadius)) {
                             playersInsideKickRadius++;
+                            claim.membersLastPos[memberName] = player.position;
                         }
                         if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
                             playersInside500mZone++;
