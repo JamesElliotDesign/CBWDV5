@@ -127,7 +127,13 @@ const PARTIAL_POI_MAP = {
 let sessionCache = [];
 
 setInterval(async () => {
-    sessionCache = await getAllOnlinePlayers();
+    try {
+        sessionCache = await getAllOnlinePlayers();
+    } catch (error) {
+        console.error("❌ Error fetching online players:", error);
+        // The cache will not be updated, but the process won't be stuck.
+        // It will try again in the next interval.
+    }
 }, 1000);
 
 function scheduleClaimReset() {
@@ -386,26 +392,38 @@ async function checkPOIZones() {
                 if (onlineMembersCount > 0) {
                     // ✅ Corrected Code with a 90-second delay
 
-                    if (claim.hasBeenEngaged && playersInsideKickRadius === 0 && !claim.abandonmentCheckTimer) { // Renamed property
-                        // POI was engaged, and we can confirm all online members are outside the kick radius.
-                        console.log(`🟡 ${poiName} is empty. Starting 90s abandonment check timer.`);
-                        claim.abandonmentCheckTimer = setTimeout(() => { // Renamed property
-                            console.log(`⏰ 90s timer for ${poiName} is up. Making final decision...`);
-                            startCooldown(poiName, { checkWipe: true });
-                        }, 90 * 1000); // <-- Increased delay to 90 seconds
-                    }
+                    // ✅ New, Resilient Abandonment Logic
 
-                    // You also need to update the re-entry check to use the new timer name
-                    // ✅ Corrected Code to Punish the Exploit
+                    if (claim.hasBeenEngaged && playersInsideKickRadius === 0) {
+                        // POI is empty. If this is the first time we've seen it empty, record a timestamp.
+                        if (!claim.firstEmptyTimestamp) {
+                            console.log(`🟡 ${poiName} appears empty. Starting 30s confirmation timer.`);
+                            claim.firstEmptyTimestamp = now;
+                        }
 
-                    if (claim.hasBeenEngaged && playersInsideKickRadius > 0 && claim.abandonmentCheckTimer) {
-                        console.log(`🔴 Players re-entered ${poiName} during abandonment check. Forcing cooldown.`);
+                        // Only if the POI has been consistently empty for 30 seconds, start the final 90s abandonment timer.
+                        if (now - claim.firstEmptyTimestamp >= 30 * 1000 && !claim.abandonmentCheckTimer) {
+                            console.log(`🟡 ${poiName} confirmed empty. Starting final 90s abandonment timer.`);
+                            claim.abandonmentCheckTimer = setTimeout(() => {
+                                console.log(`⏰ 90s timer for ${poiName} is up. Making final decision...`);
+                                startCooldown(poiName, { checkWipe: true });
+                            }, 90 * 1000);
+                        }
+                    } else if (claim.hasBeenEngaged && playersInsideKickRadius > 0) {
+                        // Players are inside the POI.
                         
-                        // First, clear the pending 90-second timer since we are acting immediately
-                        clearTimeout(claim.abandonmentCheckTimer);
+                        // If an abandonment timer is running, punish the re-entry.
+                        if (claim.abandonmentCheckTimer) {
+                            console.log(`🔴 Players re-entered ${poiName} during final abandonment check. Forcing cooldown.`);
+                            clearTimeout(claim.abandonmentCheckTimer);
+                            startCooldown(poiName, { checkWipe: false });
+                        }
                         
-                        // Immediately start the cooldown process. Treat it as a voluntary exit (no wipe check).
-                        startCooldown(poiName, { checkWipe: false }); 
+                        // If a confirmation timer was running, cancel it.
+                        if (claim.firstEmptyTimestamp) {
+                            console.log(`🟢 Players re-entered ${poiName} during confirmation period. Aborting abandonment.`);
+                            claim.firstEmptyTimestamp = null;
+                        }
                     }
                     
                     else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
@@ -633,6 +651,7 @@ app.post("/webhook", async (req, res) => {
                     individualGracePeriods: {},
                     members: new Set([normalizedClaimant]),
                     membersLastPos: {},
+                    firstEmptyTimestamp: null,
                     abandonmentCheckTimer: null,
                     displayMembers: [{
                         name: normalizedClaimant,
