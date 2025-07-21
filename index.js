@@ -249,43 +249,40 @@ async function forceExpireAndStartCooldown(poiName) {
     }, 60 * 1000); // 60 second delay
 }
 
+// ✅ Use this robust version of startCooldown
+
 function startCooldown(poiName, options = { checkWipe: false }) {
     const claim = CLAIMS[poiName];
     if (!claim || claim.state !== 'ACTIVE') return;
 
     clearTimeout(claim.timerId);
 
-    let gracePeriodGranted = false;
     if (options.checkWipe) {
-        console.log(`🩺 Checking for respawn vs. voluntary exit at ${poiName}...`);
-        let membersFound = 0;
-        let membersWhoRespawned = 0;
-
+        console.log(`🩺 Performing final check for respawn vs. voluntary exit at ${poiName}...`);
+        
+        let confirmedSurvivors = 0;
         for (const memberName of claim.members) {
             const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
             const lastPos = claim.membersLastPos[memberName];
 
             if (player && lastPos) {
-                membersFound++;
                 const distMovedSquared = Math.pow(player.position[0] - lastPos[0], 2) + Math.pow(player.position[1] - lastPos[1], 2);
-                
-                if (distMovedSquared > RESPAWN_DISTANCE_THRESHOLD_SQUARED) {
-                    membersWhoRespawned++;
+                if (distMovedSquared <= RESPAWN_DISTANCE_THRESHOLD_SQUARED) {
+                    confirmedSurvivors++;
                 }
             }
         }
         
-        if (membersFound > 0 && membersFound === membersWhoRespawned) {
-            gracePeriodGranted = true;
+        if (confirmedSurvivors === 0) {
             claim.gracePeriodAllowed = true;
-            console.log(`✅ Respawn detected for ${poiName}. Granting grace period.`);
+            console.log(`✅ Team wipe detected for ${poiName} (0 survivors found). Granting grace period.`);
             sendServerMessage(`A team wipe was detected at ${poiName}. Your group may return for gear. A 15-min timer will start when the first member arrives.`);
         } else {
-            console.log(`❌ Voluntary exit detected for ${poiName}. No grace period granted.`);
+            console.log(`❌ Voluntary exit detected for ${poiName} (${confirmedSurvivors} survivor(s) found). No grace period granted.`);
             sendServerMessage(`${claim.displayName}'s group has left ${poiName}. It is now on cooldown.`);
         }
+
     } else {
-        // This is for a simple abandonment without engaging the POI.
         sendServerMessage(`${poiName} claim was abandoned and is now on cooldown.`);
     }
 
@@ -387,25 +384,35 @@ async function checkPOIZones() {
 
                 // Check for abandonment only if we have positive confirmation of players' locations.
                 if (onlineMembersCount > 0) {
-                    if (claim.hasBeenEngaged && playersInsideKickRadius === 0 && !claim.cooldownCheckTimer) {
+                    // ✅ Corrected Code with a 90-second delay
+
+                    if (claim.hasBeenEngaged && playersInsideKickRadius === 0 && !claim.abandonmentCheckTimer) { // Renamed property
                         // POI was engaged, and we can confirm all online members are outside the kick radius.
-                        console.log(`🟡 ${poiName} is empty. Starting 60s cooldown check timer.`);
-                        claim.cooldownCheckTimer = setTimeout(() => {
-                            console.log(`⏰ 60s timer for ${poiName} is up. Checking for respawn...`);
+                        console.log(`🟡 ${poiName} is empty. Starting 90s abandonment check timer.`);
+                        claim.abandonmentCheckTimer = setTimeout(() => { // Renamed property
+                            console.log(`⏰ 90s timer for ${poiName} is up. Making final decision...`);
                             startCooldown(poiName, { checkWipe: true });
-                        }, 60 * 1000);
-                    } else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
+                        }, 90 * 1000); // <-- Increased delay to 90 seconds
+                    }
+
+                    // You also need to update the re-entry check to use the new timer name
+                    // ✅ Corrected Code to Punish the Exploit
+
+                    if (claim.hasBeenEngaged && playersInsideKickRadius > 0 && claim.abandonmentCheckTimer) {
+                        console.log(`🔴 Players re-entered ${poiName} during abandonment check. Forcing cooldown.`);
+                        
+                        // First, clear the pending 90-second timer since we are acting immediately
+                        clearTimeout(claim.abandonmentCheckTimer);
+                        
+                        // Immediately start the cooldown process. Treat it as a voluntary exit (no wipe check).
+                        startCooldown(poiName, { checkWipe: false }); 
+                    }
+                    
+                    else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
                         // POI was never engaged, and we can confirm all online members are outside the 500m zone.
                         console.log(`🟡 ${poiName} was claimed but never engaged. Abandoning claim.`);
                         startCooldown(poiName, { checkWipe: false });
                     }
-                }
-                
-                // This part handles players re-entering during the 60s delay. It remains the same.
-                if (claim.hasBeenEngaged && playersInsideKickRadius > 0 && claim.cooldownCheckTimer) {
-                    console.log(`🟢 Players re-entered ${poiName}. Cancelling cooldown check.`);
-                    clearTimeout(claim.cooldownCheckTimer);
-                    claim.cooldownCheckTimer = null;
                 }
             }
 
@@ -479,7 +486,7 @@ async function checkPOIZones() {
     }
 }
 
-setInterval(checkPOIZones, 30 * 1000); // Increased responsiveness
+setInterval(checkPOIZones, 10 * 1000); // Increased responsiveness
 
 const processedMessages = new Map();
 setInterval(() => {
@@ -626,7 +633,7 @@ app.post("/webhook", async (req, res) => {
                     individualGracePeriods: {},
                     members: new Set([normalizedClaimant]),
                     membersLastPos: {},
-                    cooldownCheckTimer: null,
+                    abandonmentCheckTimer: null,
                     displayMembers: [{
                         name: normalizedClaimant,
                         displayName: playerName.trim()
