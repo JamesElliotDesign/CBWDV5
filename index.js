@@ -396,28 +396,34 @@ async function checkPOIZones() {
                             claim.firstEmptyTimestamp = now;
                         }
 
-                        // Only if the POI has been consistently empty for 30 seconds, start the final 90s abandonment timer.
-                        if (now - claim.firstEmptyTimestamp >= 30 * 1000 && !claim.abandonmentCheckTimer) {
+                        // Only if the POI has been consistently empty for 20 seconds, start the final 50s abandonment timer.
+                        if (now - claim.firstEmptyTimestamp >= 20 * 1000 && !claim.abandonmentCheckTimer) {
                             console.log(`🟡 ${poiName} confirmed empty. Starting final 90s abandonment timer.`);
                             claim.abandonmentCheckTimer = setTimeout(() => {
-                                console.log(`⏰ 90s timer for ${poiName} is up. Making final decision...`);
+                                console.log(`⏰ 50s timer for ${poiName} is up. Making final decision...`);
                                 startCooldown(poiName, { checkWipe: true });
-                            }, 90 * 1000);
+                            }, 50 * 1000);
                         }
+                    // ✅ This is the new "intelligent check" logic
+
                     } else if (claim.hasBeenEngaged && playersInsideKickRadius > 0) {
-                        // Players are inside the POI.
+                        // Players have re-entered the POI. This cancels any abandonment process.
                         
-                        // If an abandonment timer is running, punish the re-entry.
-                        if (claim.abandonmentCheckTimer) {
-                            console.log(`🔴 Players re-entered ${poiName} during final abandonment check. Forcing cooldown.`);
+                        // If a confirmation or final abandonment timer was running...
+                        if (claim.firstEmptyTimestamp || claim.abandonmentCheckTimer) {
+                            
+                            console.log(`🟢 Players re-entered ${poiName}. Checking for wipe vs voluntary return.`);
+                            
+                            // Immediately clear any pending timers.
                             clearTimeout(claim.abandonmentCheckTimer);
-                            startCooldown(poiName, { checkWipe: false });
-                        }
-                        
-                        // If a confirmation timer was running, cancel it.
-                        if (claim.firstEmptyTimestamp) {
-                            console.log(`🟢 Players re-entered ${poiName} during confirmation period. Aborting abandonment.`);
+                            
+                            // Nullify the tracking properties.
                             claim.firstEmptyTimestamp = null;
+                            claim.abandonmentCheckTimer = null;
+                            
+                            // And now, immediately run the wipe check to make an intelligent decision.
+                            // This will correctly identify if they respawned or just walked away and back.
+                            startCooldown(poiName, { checkWipe: true });
                         }
                     }
                     
