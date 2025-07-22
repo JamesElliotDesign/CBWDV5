@@ -44,7 +44,7 @@ const TELEPORT_WARNING_DURATION = 30 * 1000; // 30 seconds
 // Radii and Distances (using squared values is faster than Math.sqrt)
 const GROUPING_RADIUS_SQUARED = 100 * 100; // 100m
 const WIPE_CHECK_RADIUS_SQUARED = 500 * 500; // 500m
-const RESPAWN_DISTANCE_THRESHOLD_SQUARED = 400 * 400; // 400m
+const RESPAWN_DISTANCE_THRESHOLD_SQUARED = 470 * 470; // 465m
 
 // List of T5 POIs that get an extended claim time
 const T5_POIS = new Set([
@@ -60,6 +60,7 @@ const CLAIM_REGEX = /^!?\/?claim\s+([A-Za-z0-9_ -]+)\b/i;
 const CANCEL_CLAIM_REGEX = /^!?\/?cancel\s+([A-Za-z0-9_ -]+)\b/i;
 const CHECK_CLAIMS_REGEX = /^!?\/?check claims\b/i;
 const CHECK_POI_REGEX = /^!?\/?check\s+([A-Za-z0-9_ -]+)\b/i;
+const JOIN_CLAIM_REGEX = /^!?\/?join\s+([A-Za-z0-9_ -]+)\b/i; 
 
 const EXCLUDED_POIS = [];
 
@@ -281,6 +282,7 @@ function startCooldown(poiName, options = { checkWipe: false }) {
         
         if (confirmedSurvivors === 0) {
             claim.gracePeriodAllowed = true;
+            claim.graceStatus = {}; // Initialize the status tracker
             console.log(`✅ Team wipe detected for ${poiName} (0 survivors found). Granting grace period.`);
             sendServerMessage(`A team wipe was detected at ${poiName}. Your group may return for gear. A 15-min timer will start when the first member arrives.`);
         } else {
@@ -332,7 +334,6 @@ async function checkPOIZones() {
                 }
 
                 // Now, check if the player is currently in ANY claimed POI where they are an authorized member.
-                // If they are, they are considered safe, and any old warning should be cancelled.
                 for (const [poiName, config] of Object.entries(POI_CONFIG)) {
                     const claim = CLAIMS[poiName];
                     if (claim && claim.state === 'ACTIVE' && claim.members.has(player.name.trim().toLowerCase())) {
@@ -357,15 +358,13 @@ async function checkPOIZones() {
 
             // --- ACTIVE PHASE LOGIC (checks if group left early) ---
             if (claim && claim.state === 'ACTIVE') {
-                // First, update the last known position for each online member
-
                 let playersInsideKickRadius = 0;
                 let playersInside500mZone = 0;
-                let onlineMembersCount = 0; // New counter for members with valid data
+                let onlineMembersCount = 0; 
 
                 for (const memberName of claim.members) {
                     const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-                    if (player && player.position) { // Only consider players who are online with valid position data
+                    if (player && player.position) { 
                         onlineMembersCount++;
                         const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
                         if (distSquared <= (config.kickRadius * config.kickRadius)) {
@@ -378,61 +377,57 @@ async function checkPOIZones() {
                     }
                 }
 
-                // If anyone enters the kick radius, the claim is permanently marked as "engaged".
                 if (playersInsideKickRadius > 0) {
                     claim.hasBeenEngaged = true;
                 }
 
-                // Check for abandonment only if we have positive confirmation of players' locations.
+                // --- START OF CORRECTED ABANDONMENT LOGIC ---
+                // This entire block handles abandonment and re-entry checks.
                 if (onlineMembersCount > 0) {
-                    // ✅ Corrected Code with a 90-second delay
-
-                    // ✅ New, Resilient Abandonment Logic
-
                     if (claim.hasBeenEngaged && playersInsideKickRadius === 0) {
-                        // POI is empty. If this is the first time we've seen it empty, record a timestamp.
-                        if (!claim.firstEmptyTimestamp) {
-                            console.log(`🟡 ${poiName} appears empty. Starting 30s confirmation timer.`);
-                            claim.firstEmptyTimestamp = now;
-                        }
+                        // POI appears empty. Increment the counter.
+                        claim.consecutiveEmptyChecks++;
 
-                        // Only if the POI has been consistently empty for 20 seconds, start the final 50s abandonment timer.
-                        if (now - claim.firstEmptyTimestamp >= 20 * 1000 && !claim.abandonmentCheckTimer) {
-                            console.log(`🟡 ${poiName} confirmed empty. Starting final 90s abandonment timer.`);
-                            claim.abandonmentCheckTimer = setTimeout(() => {
-                                console.log(`⏰ 50s timer for ${poiName} is up. Making final decision...`);
-                                startCooldown(poiName, { checkWipe: true });
-                            }, 50 * 1000);
+                        // Only if the POI has been consistently empty for 3 checks (30 seconds)...
+                        if (claim.consecutiveEmptyChecks >= 3) {
+                            // ...and if the main abandonment timer hasn't started yet...
+                            if (!claim.firstEmptyTimestamp) {
+                                // ...start the final abandonment process.
+                                console.log(`🟡 ${poiName} has been empty for 30s. Starting final confirmation timer.`);
+                                claim.firstEmptyTimestamp = now; // Mark the start
+                            }
                         }
-                    // ✅ This is the new "intelligent check" logic
-
                     } else if (claim.hasBeenEngaged && playersInsideKickRadius > 0) {
-                        // Players have re-entered the POI. This cancels any abandonment process.
-                        
-                        // If a confirmation or final abandonment timer was running...
-                        if (claim.firstEmptyTimestamp || claim.abandonmentCheckTimer) {
-                            
-                            console.log(`🟢 Players re-entered ${poiName}. Checking for wipe vs voluntary return.`);
-                            
-                            // Immediately clear any pending timers.
+                        // Players are inside the POI. Reset any empty checks.
+                        claim.consecutiveEmptyChecks = 0;
+
+                        // This is the "re-entry" logic. It will now only trigger if the 30s check passed.
+                        if (claim.firstEmptyTimestamp) {
+                            console.log(`🟢 Players re-entered ${poiName} after abandonment process started. Making decision.`);
                             clearTimeout(claim.abandonmentCheckTimer);
-                            
-                            // Nullify the tracking properties.
                             claim.firstEmptyTimestamp = null;
                             claim.abandonmentCheckTimer = null;
-                            
-                            // And now, immediately run the wipe check to make an intelligent decision.
-                            // This will correctly identify if they respawned or just walked away and back.
                             startCooldown(poiName, { checkWipe: true });
                         }
-                    }
-                    
-                    else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
-                        // POI was never engaged, and we can confirm all online members are outside the 500m zone.
+                    } else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
+                        // This handles claims that were never entered in the first place.
                         console.log(`🟡 ${poiName} was claimed but never engaged. Abandoning claim.`);
                         startCooldown(poiName, { checkWipe: false });
                     }
+
+                    // This logic runs *after* the 30-second check has confirmed the POI is likely empty.
+                    if (claim.firstEmptyTimestamp && !claim.abandonmentCheckTimer) {
+                        // If 20 seconds have passed since the process started, start the final 50s cooldown timer.
+                        if (now - claim.firstEmptyTimestamp >= 15 * 1000) {
+                            console.log(`🟡 ${poiName} confirmed empty. Starting final 50s abandonment timer.`);
+                            claim.abandonmentCheckTimer = setTimeout(() => {
+                                console.log(`⏰ 50s timer for ${poiName} is up. Making final decision...`);
+                                startCooldown(poiName, { checkWipe: true });
+                            }, 40 * 1000);
+                        }
+                    }
                 }
+                // --- END OF CORRECTED ABANDONMENT LOGIC ---
             }
 
             // --- UNIVERSAL ENFORCEMENT & WARNING LOOP ---
@@ -445,13 +440,30 @@ async function checkPOIZones() {
                 if (claim && claim.members.has(normalizedName)) {
                     isAuthorized = true;
                     if (claim.state === 'COOLDOWN') {
-                        // If grace is allowed but not started, trigger it on entering 500m zone
-                        if (claim.gracePeriodAllowed && !claim.individualGracePeriods[normalizedName] && distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
-                            claim.individualGracePeriods[normalizedName] = now + GRACE_PERIOD_DURATION;
-                            console.log(`⏱️ ${playerName} triggered their 15-min grace timer for ${poiName}.`);
-                            sendServerMessage(`${playerName} has returned to ${poiName}. Your 15-minute gear retrieval timer has begun!`);
+                        if (claim.gracePeriodAllowed) {
+                            const currentStatus = claim.graceStatus ? claim.graceStatus[normalizedName] : undefined;
+                            const playerInZone = distSquared <= WIPE_CHECK_RADIUS_SQUARED;
+
+                            if (playerInZone) {
+                                if (currentStatus !== 'IN_ZONE') {
+                                    claim.individualGracePeriods[normalizedName] = now + GRACE_PERIOD_DURATION;
+                                    if (claim.graceStatus) claim.graceStatus[normalizedName] = 'IN_ZONE';
+
+                                    const message = currentStatus === 'OUT_OF_ZONE'
+                                        ? `${playerName}, you have returned to ${poiName}. Your 15-minute gear retrieval timer has been reset!`
+                                        : `${playerName} has returned to ${poiName}. Your 15-minute gear retrieval timer has begun!`;
+
+                                    console.log(`⏱️ ${playerName} triggered/reset their grace timer for ${poiName}.`);
+                                    sendServerMessage(message);
+                                }
+                            } else {
+                                if (currentStatus === 'IN_ZONE') {
+                                    if (claim.graceStatus) claim.graceStatus[normalizedName] = 'OUT_OF_ZONE';
+                                    console.log(`👣 ${playerName} has left the grace area for ${poiName}.`);
+                                }
+                            }
                         }
-                        // Check if the individual grace period has expired
+                        
                         const graceUntil = claim.individualGracePeriods[normalizedName];
                         if (!graceUntil || now > graceUntil) {
                             isAuthorized = false;
@@ -459,25 +471,22 @@ async function checkPOIZones() {
                     }
                 }
 
-              // ✅ PASTE THIS CORRECTED CODE IN ITS PLACE
-
-// If player is inside kick radius and NOT authorized
+              // If player is inside kick radius and NOT authorized
               if (distSquared <= (config.kickRadius * config.kickRadius) && !isAuthorized) {
                   if (!TELEPORT_WARNINGS[playerName]) {
-                      // Issue a new warning
                       console.log(`⚠️ ${playerName} entered restricted area ${poiName}. Starting 30s timer.`);
                       sendServerMessage(`Warning: ${playerName}, you are in a restricted area. You will be removed in 30 seconds if you do not leave.`);
                       const timerId = setTimeout(async () => {
                       try {
                           const currentPlayerState = sessionCache.find(p => p.steam64 === player.steam64);
-                          const config = POI_CONFIG[poiName];
+                          const currentConfig = POI_CONFIG[poiName]; // Use a different variable name to avoid shadowing
 
-                          if (currentPlayerState && config) {
-                              const distSquared = Math.pow(currentPlayerState.position[0] - config.position[0], 2) + Math.pow(currentPlayerState.position[1] - config.position[2], 2);
+                          if (currentPlayerState && currentConfig) {
+                              const currentDistSquared = Math.pow(currentPlayerState.position[0] - currentConfig.position[0], 2) + Math.pow(currentPlayerState.position[1] - currentConfig.position[2], 2);
                               
-                              if (distSquared <= (config.kickRadius * config.kickRadius)) {
+                              if (currentDistSquared <= (currentConfig.kickRadius * currentConfig.kickRadius)) {
                                   console.log(`🚀 Final check passed. Teleporting ${currentPlayerState.name} from ${poiName}.`);
-                                  await teleportPlayerBySteam64(currentPlayerState.steam64, config.safePos);
+                                  await teleportPlayerBySteam64(currentPlayerState.steam64, currentConfig.safePos);
                               } else {
                                   console.log(`🚶 Final check failed. ${currentPlayerState.name} left the area. Teleport aborted.`);
                               }
@@ -505,7 +514,7 @@ async function checkPOIZones() {
     }
 }
 
-setInterval(checkPOIZones, 10 * 1000); // Increased responsiveness
+setInterval(checkPOIZones, 5 * 1000); // Increased responsiveness
 
 const processedMessages = new Map();
 setInterval(() => {
@@ -654,6 +663,7 @@ app.post("/webhook", async (req, res) => {
                     membersLastPos: {},
                     firstEmptyTimestamp: null,
                     abandonmentCheckTimer: null,
+                    consecutiveEmptyChecks: 0,
                     displayMembers: [{
                         name: normalizedClaimant,
                         displayName: playerName.trim()
@@ -711,6 +721,70 @@ app.post("/webhook", async (req, res) => {
                 await sendServerMessage(`${playerName} claimed ${corrected}${groupMsg}.`);
                 return res.sendStatus(204);
             }
+
+            // ✅ Handle join claim
+            const joinMatch = messageContent.match(JOIN_CLAIM_REGEX);
+            if (joinMatch) {
+                const corrected = findMatchingPOI(joinMatch[1]);
+                if (!corrected) {
+                    await sendServerMessage(`Invalid POI: ${joinMatch[1]}.`);
+                    return res.sendStatus(204);
+                }
+
+                const claim = CLAIMS[corrected];
+                const normalizedJoinerName = playerName.trim().toLowerCase();
+
+                if (!claim || claim.state !== 'ACTIVE') {
+                    await sendServerMessage(`${corrected} is not actively claimed.`);
+                    return res.sendStatus(204);
+                }
+
+                if (claim.members.has(normalizedJoinerName)) {
+                    await sendServerMessage(`You are already part of the claim for ${corrected}.`);
+                    return res.sendStatus(204);
+                }
+
+                if (claim.hasBeenEngaged) {
+                    await sendServerMessage(`Cannot join ${corrected}; the POI is already active.`);
+                    return res.sendStatus(204);
+                }
+
+                if (CLAIM_HISTORY[corrected] && CLAIM_HISTORY[corrected].has(normalizedJoinerName)) {
+                    await sendServerMessage(`You have already completed ${corrected} this restart and cannot join.`);
+                    return res.sendStatus(204);
+                }
+
+                const joinerPlayer = sessionCache.find(p => p.name.trim().toLowerCase() === normalizedJoinerName);
+                const claimantPlayer = sessionCache.find(p => p.name.trim().toLowerCase() === claim.player);
+
+                if (!joinerPlayer || !claimantPlayer) {
+                    await sendServerMessage(`Could not verify player locations for grouping. Please try again.`);
+                    return res.sendStatus(204);
+                }
+
+                const distSquared = Math.pow(joinerPlayer.position[0] - claimantPlayer.position[0], 2) + Math.pow(joinerPlayer.position[1] - claimantPlayer.position[1], 2);
+
+                if (distSquared > GROUPING_RADIUS_SQUARED) {
+                    await sendServerMessage(`You are too far from the group leader to join the claim.`);
+                    return res.sendStatus(204);
+                }
+
+                // All checks passed, add the player to the claim
+                claim.members.add(normalizedJoinerName);
+                claim.displayMembers.push({ name: normalizedJoinerName, displayName: playerName.trim() });
+
+                // Also add them to the history so they can't re-claim/re-join
+                if (!DYNAMIC_POIS.has(corrected)) {
+                    if (!CLAIM_HISTORY[corrected]) CLAIM_HISTORY[corrected] = new Set();
+                    CLAIM_HISTORY[corrected].add(normalizedJoinerName);
+                }
+
+                console.log(`➕ ${playerName} successfully joined the claim for ${corrected}.`);
+                await sendServerMessage(`${playerName.trim()} has joined ${claim.displayName}'s group for ${corrected}.`);
+                return res.sendStatus(204);
+            }
+
+            // --- END OF NEW BLOCK ---
 
             // ✅ Unclaim handler
             const unclaimMatch = messageContent.match(CANCEL_CLAIM_REGEX);
