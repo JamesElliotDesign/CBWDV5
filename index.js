@@ -41,6 +41,12 @@ const COOLDOWN_DURATION = 45 * 60 * 1000;
 const GRACE_PERIOD_DURATION = 15 * 60 * 1000;
 const TELEPORT_WARNING_DURATION = 30 * 1000; // 30 seconds
 
+const PLAYER_OFFLINE_THRESHOLD = 45 * 1000; // 45 seconds
+const ABANDON_THRESHOLD_MS = 60 * 1000; // 1 minute
+
+// This will store our reliable player data with 'lastSeen' timestamps
+const MASTER_PLAYER_LIST = {}; // key: normalizedPlayerName, value: { ...playerData, lastSeen: timestamp }
+
 // Radii and Distances (using squared values is faster than Math.sqrt)
 const GROUPING_RADIUS_SQUARED = 100 * 100; // 100m
 const WIPE_CHECK_RADIUS_SQUARED = 500 * 500; // 500m
@@ -129,11 +135,24 @@ let sessionCache = [];
 
 setInterval(async () => {
     try {
-        sessionCache = await getAllOnlinePlayers();
+        const freshPlayerData = await getAllOnlinePlayers();
+
+        // ✅ CRITICAL CHECK: Only update the cache if the API returned a valid, non-empty array.
+        if (freshPlayerData && Array.isArray(freshPlayerData) && freshPlayerData.length > 0) {
+            sessionCache = freshPlayerData; // Keep this for now for any parts of the code we don't change
+            const now = Date.now();
+            
+            // ✅ Update our new reliable master list
+            for (const player of freshPlayerData) {
+                if (player && player.name) {
+                    MASTER_PLAYER_LIST[player.name.trim().toLowerCase()] = { ...player, lastSeen: now };
+                }
+            }
+        } else {
+            console.warn("⚠️ API returned no player data. Using stale cache to avoid errors.");
+        }
     } catch (error) {
         console.error("❌ Error fetching online players:", error);
-        // The cache will not be updated, but the process won't be stuck.
-        // It will try again in the next interval.
     }
 }, 1000);
 
@@ -176,6 +195,19 @@ function resetClaims() {
 }
 
 scheduleClaimReset();
+
+// --- ADD THIS NEW HELPER FUNCTION ---
+// Checks our resilient master list to see if a player should be considered online.
+function isPlayerConsideredOnline(playerName) {
+    if (!playerName) return false;
+    const normalizedName = playerName.trim().toLowerCase();
+    const playerRecord = MASTER_PLAYER_LIST[normalizedName];
+
+    if (!playerRecord) return false;
+
+    // A player is "online" if we have seen them in the last 45 seconds.
+    return (Date.now() - playerRecord.lastSeen) < PLAYER_OFFLINE_THRESHOLD;
+}
 
 
 function validateSignature(req) {
@@ -229,16 +261,18 @@ async function forceExpireAndStartCooldown(poiName) {
     const config = POI_CONFIG[poiName];
     if (!config) return;
 
-    // Give a 60-second warning before teleporting everyone out.
+    // Give a 30-second warning before teleporting everyone out.
     setTimeout(async () => {
         const teleportPromises = [];
         const currentClaim = CLAIMS[poiName]; // Re-fetch claim state
-        if (!currentClaim || currentClaim.state !== 'ACTIVE') return; // Stop if claim was cancelled during warning
+        if (!currentClaim || currentClaim.state !== 'ACTIVE') return;
 
-        for (const player of sessionCache) {
-            const normalizedName = player.name.trim().toLowerCase();
-            if (currentClaim.members.has(normalizedName)) {
+        for (const memberName of currentClaim.members) {
+            // ✅ Loop through claim members instead of the entire server cache
+            if (isPlayerConsideredOnline(memberName)) {
+                const player = MASTER_PLAYER_LIST[memberName]; // ✅ Use reliable master list
                 const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
+                
                 if (distSquared <= (config.kickRadius * config.kickRadius)) {
                     console.log(`Evicting ${player.name} from ${poiName}.`);
                     if (player.steam64) {
@@ -250,10 +284,8 @@ async function forceExpireAndStartCooldown(poiName) {
             }
         }
         await Promise.all(teleportPromises);
-        startCooldown(poiName, {
-            checkWipe: false
-        }); // Start cooldown with no grace period
-    }, 60 * 1000); // 60 second delay
+        startCooldown(poiName, { checkWipe: false });
+    }, 30 * 1000); // 30 second delay
 }
 
 // ✅ Use this robust version of startCooldown
@@ -269,10 +301,10 @@ function startCooldown(poiName, options = { checkWipe: false }) {
         
         let confirmedSurvivors = 0;
         for (const memberName of claim.members) {
-            const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
             const lastPos = claim.membersLastPos[memberName];
-
-            if (player && lastPos) {
+            // ✅ Check if the player is reliably online AND has a last known position in the POI
+            if (isPlayerConsideredOnline(memberName) && lastPos) {
+                const player = MASTER_PLAYER_LIST[memberName]; // ✅ Use the reliable master list
                 const distMovedSquared = Math.pow(player.position[0] - lastPos[0], 2) + Math.pow(player.position[1] - lastPos[1], 2);
                 if (distMovedSquared <= RESPAWN_DISTANCE_THRESHOLD_SQUARED) {
                     confirmedSurvivors++;
@@ -282,7 +314,7 @@ function startCooldown(poiName, options = { checkWipe: false }) {
         
         if (confirmedSurvivors === 0) {
             claim.gracePeriodAllowed = true;
-            claim.graceStatus = {}; // Initialize the status tracker
+            // No need for graceStatus, we handle it differently now
             console.log(`✅ Team wipe detected for ${poiName} (0 survivors found). Granting grace period.`);
             sendServerMessage(`A team wipe was detected at ${poiName}. Your group may return for gear. A 15-min timer will start when the first member arrives.`);
         } else {
@@ -319,34 +351,21 @@ async function checkPOIZones() {
     try {
         const now = Date.now();
 
-        // --- CANCEL EXPIRED TELEPORT WARNINGS ---
+        // This loop handles players who are on a teleport countdown.
         for (const playerName in TELEPORT_WARNINGS) {
-            const player = sessionCache.find(p => p.name === playerName);
             const warning = TELEPORT_WARNINGS[playerName];
-            const warningConfig = POI_CONFIG[warning.poiName];
-
-            let isSafe = true;
-            if (player && warningConfig) {
-                // First, check if the player is still inside the zone they were warned about.
-                const distSquaredFromWarning = Math.pow(player.position[0] - warningConfig.position[0], 2) + Math.pow(player.position[1] - warningConfig.position[2], 2);
-                if (distSquaredFromWarning <= (warningConfig.kickRadius * warningConfig.kickRadius)) {
-                    isSafe = false;
-                }
-
-                // Now, check if the player is currently in ANY claimed POI where they are an authorized member.
-                for (const [poiName, config] of Object.entries(POI_CONFIG)) {
-                    const claim = CLAIMS[poiName];
-                    if (claim && claim.state === 'ACTIVE' && claim.members.has(player.name.trim().toLowerCase())) {
-                        const distSquaredFromClaim = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
-                        if (distSquaredFromClaim <= (config.kickRadius * config.kickRadius)) {
-                            isSafe = true; // Player is in a POI they have claimed. They are safe.
-                            break; // Exit the inner loop
-                        }
-                    }
-                }
+            // Check if player is still considered online and in the zone
+            if (!isPlayerConsideredOnline(playerName) || !warning) {
+                clearTimeout(warning.timerId);
+                delete TELEPORT_WARNINGS[playerName];
+                continue;
             }
+            const playerRecord = MASTER_PLAYER_LIST[playerName.trim().toLowerCase()];
+            const warningConfig = POI_CONFIG[warning.poiName];
+            const distSquared = Math.pow(playerRecord.position[0] - warningConfig.position[0], 2) + Math.pow(playerRecord.position[1] - warningConfig.position[2], 2);
 
-            if (isSafe) {
+            if (distSquared > (warningConfig.kickRadius * warningConfig.kickRadius)) {
+                // Player left the restricted area, cancel the teleport.
                 console.log(`🚶 ${playerName} is now in a safe location. Teleport cancelled.`);
                 clearTimeout(warning.timerId);
                 delete TELEPORT_WARNINGS[playerName];
@@ -356,157 +375,97 @@ async function checkPOIZones() {
         for (const [poiName, config] of Object.entries(POI_CONFIG)) {
             const claim = CLAIMS[poiName];
 
-            // --- ACTIVE PHASE LOGIC (checks if group left early) ---
+            // --- ACTIVE CLAIM LOGIC ---
             if (claim && claim.state === 'ACTIVE') {
                 let playersInsideKickRadius = 0;
-                let playersInside500mZone = 0;
-                let onlineMembersCount = 0; 
+                let onlineMembersCount = 0;
 
                 for (const memberName of claim.members) {
-                    const player = sessionCache.find(p => p.name.trim().toLowerCase() === memberName);
-                    if (player && player.position) { 
+                    if (isPlayerConsideredOnline(memberName)) {
                         onlineMembersCount++;
+                        const player = MASTER_PLAYER_LIST[memberName];
                         const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
                         if (distSquared <= (config.kickRadius * config.kickRadius)) {
                             playersInsideKickRadius++;
-                            claim.membersLastPos[memberName] = player.position;
-                        }
-                        if (distSquared <= WIPE_CHECK_RADIUS_SQUARED) {
-                            playersInside500mZone++;
+                            claim.membersLastPos[memberName] = player.position; // Keep updating last known good position
                         }
                     }
                 }
+                
+                // If POI was claimed but no members are considered online anymore, abandon it.
+                if (onlineMembersCount === 0 && claim.hasBeenEngaged) {
+                     console.log(`🟡 ${poiName} was abandoned (all members offline). Starting cooldown.`);
+                     startCooldown(poiName, { checkWipe: true });
+                     continue; // Move to the next POI
+                }
 
+                // If players are inside, the POI is active. Mark as engaged and update the 'last seen' timestamp.
                 if (playersInsideKickRadius > 0) {
                     claim.hasBeenEngaged = true;
-                }
-
-                // --- START OF CORRECTED ABANDONMENT LOGIC ---
-                // This entire block handles abandonment and re-entry checks.
-                if (onlineMembersCount > 0) {
-                    if (claim.hasBeenEngaged && playersInsideKickRadius === 0) {
-                        // POI appears empty. Increment the counter.
-                        claim.consecutiveEmptyChecks++;
-
-                        // Only if the POI has been consistently empty for 3 checks (30 seconds)...
-                        if (claim.consecutiveEmptyChecks >= 3) {
-                            // ...and if the main abandonment timer hasn't started yet...
-                            if (!claim.firstEmptyTimestamp) {
-                                // ...start the final abandonment process.
-                                console.log(`🟡 ${poiName} has been empty for 30s. Starting final confirmation timer.`);
-                                claim.firstEmptyTimestamp = now; // Mark the start
-                            }
-                        }
-                    } else if (claim.hasBeenEngaged && playersInsideKickRadius > 0) {
-                        // Players are inside the POI. Reset any empty checks.
-                        claim.consecutiveEmptyChecks = 0;
-
-                        // This is the "re-entry" logic. It will now only trigger if the 30s check passed.
-                        if (claim.firstEmptyTimestamp) {
-                            console.log(`🟢 Players re-entered ${poiName} after abandonment process started. Making decision.`);
-                            clearTimeout(claim.abandonmentCheckTimer);
-                            claim.firstEmptyTimestamp = null;
-                            claim.abandonmentCheckTimer = null;
-                            startCooldown(poiName, { checkWipe: true });
-                        }
-                    } else if (!claim.hasBeenEngaged && playersInside500mZone === 0) {
-                        // This handles claims that were never entered in the first place.
-                        console.log(`🟡 ${poiName} was claimed but never engaged. Abandoning claim.`);
-                        startCooldown(poiName, { checkWipe: false });
-                    }
-
-                    // This logic runs *after* the 30-second check has confirmed the POI is likely empty.
-                    if (claim.firstEmptyTimestamp && !claim.abandonmentCheckTimer) {
-                        // If 20 seconds have passed since the process started, start the final 50s cooldown timer.
-                        if (now - claim.firstEmptyTimestamp >= 15 * 1000) {
-                            console.log(`🟡 ${poiName} confirmed empty. Starting final 50s abandonment timer.`);
-                            claim.abandonmentCheckTimer = setTimeout(() => {
-                                console.log(`⏰ 50s timer for ${poiName} is up. Making final decision...`);
-                                startCooldown(poiName, { checkWipe: true });
-                            }, 40 * 1000);
-                        }
+                    claim.lastSeenMemberTimestamp = now;
+                } else if (claim.hasBeenEngaged) {
+                    // POI has been engaged, but is now empty. Check if it's been empty long enough to be considered abandoned.
+                    const timeEmpty = now - claim.lastSeenMemberTimestamp;
+                    if (timeEmpty > ABANDON_THRESHOLD_MS) {
+                        console.log(`🟡 ${poiName} confirmed empty for over ${ABANDON_THRESHOLD_MS / 1000}s. Starting cooldown.`);
+                        startCooldown(poiName, { checkWipe: true });
+                        continue; // Move to next POI
                     }
                 }
-                // --- END OF CORRECTED ABANDONMENT LOGIC ---
             }
 
-            // --- UNIVERSAL ENFORCEMENT & WARNING LOOP ---
-            for (const player of sessionCache) {
-                const playerName = player.name.trim();
-                const normalizedName = playerName.toLowerCase();
+            // --- UNIVERSAL ENFORCEMENT & GRACE PERIOD LOGIC ---
+            // This loop checks ALL online players against the current POI.
+            for (const normalizedName in MASTER_PLAYER_LIST) {
+                if (!isPlayerConsideredOnline(normalizedName)) continue; // Skip players who are 'stale'
+                
+                const player = MASTER_PLAYER_LIST[normalizedName];
+                const playerName = player.name; // Get the cased name for messages
                 const distSquared = Math.pow(player.position[0] - config.position[0], 2) + Math.pow(player.position[1] - config.position[2], 2);
 
                 let isAuthorized = false;
                 if (claim && claim.members.has(normalizedName)) {
                     isAuthorized = true;
-                    if (claim.state === 'COOLDOWN') {
-                        if (claim.gracePeriodAllowed) {
-                            const currentStatus = claim.graceStatus ? claim.graceStatus[normalizedName] : undefined;
-                            const playerInZone = distSquared <= WIPE_CHECK_RADIUS_SQUARED;
-
-                            if (playerInZone) {
-                                if (currentStatus !== 'IN_ZONE') {
-                                    claim.individualGracePeriods[normalizedName] = now + GRACE_PERIOD_DURATION;
-                                    if (claim.graceStatus) claim.graceStatus[normalizedName] = 'IN_ZONE';
-
-                                    const message = currentStatus === 'OUT_OF_ZONE'
-                                        ? `${playerName}, you have returned to ${poiName}. Your 15-minute gear retrieval timer has been reset!`
-                                        : `${playerName} has returned to ${poiName}. Your 15-minute gear retrieval timer has begun!`;
-
-                                    console.log(`⏱️ ${playerName} triggered/reset their grace timer for ${poiName}.`);
-                                    sendServerMessage(message);
-                                }
-                            } else {
-                                if (currentStatus === 'IN_ZONE') {
-                                    if (claim.graceStatus) claim.graceStatus[normalizedName] = 'OUT_OF_ZONE';
-                                    console.log(`👣 ${playerName} has left the grace area for ${poiName}.`);
-                                }
-                            }
-                        }
-                        
+                     // Handle Grace Period logic for authorized members if POI is on cooldown
+                    if (claim.state === 'COOLDOWN' && claim.gracePeriodAllowed) {
                         const graceUntil = claim.individualGracePeriods[normalizedName];
+                        // Check if the player is in the zone and their grace period isn't already active.
+                        if (distSquared <= WIPE_CHECK_RADIUS_SQUARED && (!graceUntil || now > graceUntil)) {
+                            // Grant a new grace period and send the message.
+                            claim.individualGracePeriods[normalizedName] = now + GRACE_PERIOD_DURATION;
+                            sendServerMessage(`${playerName} has returned to ${poiName}. Your 15-minute gear retrieval timer has started!`);
+                        } else if (distSquared > WIPE_CHECK_RADIUS_SQUARED && graceUntil && now < graceUntil) {
+                            // If player leaves the zone, reset the grace period timer so they get a new one if they return.
+                            delete claim.individualGracePeriods[normalizedName];
+                        }
+                        // Re-evaluate authorization based on grace timer
                         if (!graceUntil || now > graceUntil) {
-                            isAuthorized = false;
+                           isAuthorized = false;
                         }
                     }
                 }
 
-              // If player is inside kick radius and NOT authorized
-              if (distSquared <= (config.kickRadius * config.kickRadius) && !isAuthorized) {
-                  if (!TELEPORT_WARNINGS[playerName]) {
-                      console.log(`⚠️ ${playerName} entered restricted area ${poiName}. Starting 30s timer.`);
-                      sendServerMessage(`Warning: ${playerName}, you are in a restricted area. You will be removed in 30 seconds if you do not leave.`);
-                      const timerId = setTimeout(async () => {
-                      try {
-                          const currentPlayerState = sessionCache.find(p => p.steam64 === player.steam64);
-                          const currentConfig = POI_CONFIG[poiName]; // Use a different variable name to avoid shadowing
-
-                          if (currentPlayerState && currentConfig) {
-                              const currentDistSquared = Math.pow(currentPlayerState.position[0] - currentConfig.position[0], 2) + Math.pow(currentPlayerState.position[1] - currentConfig.position[2], 2);
-                              
-                              if (currentDistSquared <= (currentConfig.kickRadius * currentConfig.kickRadius)) {
-                                  console.log(`🚀 Final check passed. Teleporting ${currentPlayerState.name} from ${poiName}.`);
-                                  await teleportPlayerBySteam64(currentPlayerState.steam64, currentConfig.safePos);
-                              } else {
-                                  console.log(`🚶 Final check failed. ${currentPlayerState.name} left the area. Teleport aborted.`);
-                              }
-                          }
-                      } catch (e) {
-                          console.error("Error during final teleport check:", e);
-                      } finally {
-                          delete TELEPORT_WARNINGS[player.name.trim()];
-                      }
-                      }, TELEPORT_WARNING_DURATION);
-                      TELEPORT_WARNINGS[playerName] = {
-                          timerId,
-                          poiName
-                      };
-                  }
-              }
-              // This is now an "else if", preventing the double warning
-              else if (claim && claim.state === 'ACTIVE' && !isAuthorized && distSquared <= (INTRUSION_RADIUS * INTRUSION_RADIUS)) {
-                  handleWarning(playerName, poiName, now);
-              }
+                // If player is inside the kick radius and NOT authorized...
+                if (distSquared <= (config.kickRadius * config.kickRadius) && !isAuthorized) {
+                    if (!TELEPORT_WARNINGS[playerName]) {
+                        // ...start the teleport countdown.
+                        console.log(`⚠️ ${playerName} entered restricted area ${poiName}. Starting ${TELEPORT_WARNING_DURATION / 1000}s timer.`);
+                        sendServerMessage(`Warning: ${playerName}, you are in a restricted area (${poiName}). You will be removed in ${TELEPORT_WARNING_DURATION / 1000} seconds.`);
+                        const timerId = setTimeout(async () => {
+                            // Final check before teleporting
+                            if (isPlayerConsideredOnline(playerName)) {
+                                console.log(`🚀 Final check passed. Teleporting ${playerName} from ${poiName}.`);
+                                await teleportPlayerBySteam64(player.steam64, config.safePos);
+                            }
+                            delete TELEPORT_WARNINGS[playerName];
+                        }, TELEPORT_WARNING_DURATION);
+                        TELEPORT_WARNINGS[playerName] = { timerId, poiName };
+                    }
+                } 
+                // If player is nearby a claimed POI and NOT authorized, give a proximity warning.
+                else if (claim && claim.state === 'ACTIVE' && !isAuthorized && distSquared <= (INTRUSION_RADIUS * INTRUSION_RADIUS)) {
+                    handleWarning(playerName, poiName, now);
+                }
             }
         }
     } catch (err) {
@@ -620,7 +579,7 @@ app.post("/webhook", async (req, res) => {
                 }
 
                 const normalizedClaimant = playerName.trim().toLowerCase();
-                const claimantPlayer = sessionCache.find(p => p.name.trim().toLowerCase() === normalizedClaimant);
+                const claimantPlayer = isPlayerConsideredOnline(normalizedClaimant) ? MASTER_PLAYER_LIST[normalizedClaimant] : null;
 
                 // --- MODIFICATION START ---
                 // All location-based and history-based checks are now inside this block
@@ -661,9 +620,8 @@ app.post("/webhook", async (req, res) => {
                     individualGracePeriods: {},
                     members: new Set([normalizedClaimant]),
                     membersLastPos: {},
-                    firstEmptyTimestamp: null,
-                    abandonmentCheckTimer: null,
-                    consecutiveEmptyChecks: 0,
+                    lastSeenMemberTimestamp: Date.now(),
+                    abandonmentNoticeSent: false,
                     displayMembers: [{
                         name: normalizedClaimant,
                         displayName: playerName.trim()
@@ -754,8 +712,8 @@ app.post("/webhook", async (req, res) => {
                     return res.sendStatus(204);
                 }
 
-                const joinerPlayer = sessionCache.find(p => p.name.trim().toLowerCase() === normalizedJoinerName);
-                const claimantPlayer = sessionCache.find(p => p.name.trim().toLowerCase() === claim.player);
+                const joinerPlayer = isPlayerConsideredOnline(normalizedJoinerName) ? MASTER_PLAYER_LIST[normalizedJoinerName] : null;
+                const claimantPlayer = isPlayerConsideredOnline(claim.player) ? MASTER_PLAYER_LIST[claim.player] : null;
 
                 if (!joinerPlayer || !claimantPlayer) {
                     await sendServerMessage(`Could not verify player locations for grouping. Please try again.`);
