@@ -154,7 +154,7 @@ setInterval(async () => {
     } catch (error) {
         console.error("❌ Error fetching online players:", error);
     }
-}, 1000);
+}, 2 * 1000);
 
 function scheduleClaimReset() {
     const now = new Date(Date.now() + 60 * 60 * 1000); // Adjust if needed for timezone offset
