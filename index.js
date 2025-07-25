@@ -639,24 +639,27 @@ app.post("/webhook", async (req, res) => {
 
                 // Add nearby group members (100m from claimant)
                 if (!DYNAMIC_POIS.has(corrected) && claimantPlayer) { // Grouping only for static POIs
-                    for (const p of sessionCache) {
+                    // ✅ Use the reliable MASTER_PLAYER_LIST for grouping
+                    for (const p of Object.values(MASTER_PLAYER_LIST)) {
                         const normalizedMemberName = p.name.trim().toLowerCase();
                         if (normalizedMemberName === normalizedClaimant) continue;
 
-                        // Player-to-player distance check
-                        const distSquared = Math.pow(p.position[0] - claimantPlayer.position[0], 2) + Math.pow(p.position[1] - claimantPlayer.position[1], 2);
+                        // ✅ Add a check to ensure the potential member is also considered online
+                        if (isPlayerConsideredOnline(normalizedMemberName)) {
+                            const distSquared = Math.pow(p.position[0] - claimantPlayer.position[0], 2) + Math.pow(p.position[1] - claimantPlayer.position[1], 2);
 
-                        if (distSquared <= GROUPING_RADIUS_SQUARED) {
-                            if (CLAIM_HISTORY[corrected] && CLAIM_HISTORY[corrected].has(normalizedMemberName)) {
-                                console.log(`Skipping ${p.name}, they have already claimed ${corrected} this cycle.`);
-                                continue;
+                            if (distSquared <= GROUPING_RADIUS_SQUARED) {
+                                if (CLAIM_HISTORY[corrected] && CLAIM_HISTORY[corrected].has(normalizedMemberName)) {
+                                    console.log(`Skipping ${p.name}, they have already claimed ${corrected} this cycle.`);
+                                    continue;
+                                }
+                                newClaim.members.add(normalizedMemberName);
+                                newClaim.displayMembers.push({
+                                    name: normalizedMemberName,
+                                    displayName: p.name.trim()
+                                });
+                                console.log(`👥 ${p.name} added to ${corrected} group.`);
                             }
-                            newClaim.members.add(normalizedMemberName);
-                            newClaim.displayMembers.push({
-                                name: normalizedMemberName,
-                                displayName: p.name.trim()
-                            });
-                            console.log(`👥 ${p.name} added to ${corrected} group.`);
                         }
                     }
                 }
