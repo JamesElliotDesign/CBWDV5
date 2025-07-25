@@ -751,7 +751,9 @@ app.post("/webhook", async (req, res) => {
             const unclaimMatch = messageContent.match(CANCEL_CLAIM_REGEX);
             if (unclaimMatch) {
                 const corrected = findMatchingPOI(unclaimMatch[1]);
-                if (!corrected || !CLAIMS[corrected]) {
+                const claim = CLAIMS[corrected]; // Get the claim object once
+
+                if (!corrected || !claim) {
                     await sendServerMessage(
                         corrected ?
                         `${corrected} is not claimed.` :
@@ -759,14 +761,22 @@ app.post("/webhook", async (req, res) => {
                     );
                     return res.sendStatus(204);
                 }
+
                 const normalized = playerName.trim().toLowerCase();
-                if (CLAIMS[corrected].player !== normalized) {
+                if (claim.player !== normalized) {
                     await sendServerMessage(
-                        `You cannot cancel claim on ${corrected}. Claimed by ${CLAIMS[corrected].displayName}.`
+                        `You cannot cancel the claim on ${corrected}. Claimed by ${claim.displayName}.`
                     );
                     return res.sendStatus(204);
                 }
-                clearTimeout(CLAIMS[corrected].timerId); // Cancel the associated timer
+                
+                // ✅ CRITICAL FIX: Only allow cancellation if the claim is active.
+                if (claim.state !== 'ACTIVE') {
+                    await sendServerMessage(`You cannot cancel a claim for ${corrected} while it is on cooldown.`);
+                    return res.sendStatus(204);
+                }
+
+                clearTimeout(claim.timerId); // Cancel the associated timer
                 delete CLAIMS[corrected];
                 await sendServerMessage(`${playerName} cancelled their claim on ${corrected}.`);
                 return res.sendStatus(204);
